@@ -1,0 +1,5 @@
+Led 8 A/B tests per month on onboarding flows; improved activation by 12%.
+Owned integration program for 120+ retail partners; cut time-to-live from 10 to 3 days.
+Co-led GDPR DPIA and vendor reviews with legal; reduced data risk incidents by 40%.
+Shipped size‑recommendation API improvements; reduced mis‑fit returns by 9% across EU clients.
+Built a cross‑functional incident runbook; drove 99.95% uptime for tier‑1 customers.

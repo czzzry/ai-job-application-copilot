@@ -1,0 +1,16 @@
+# Python/venv
+.venv/
+__pycache__/
+*.pyc
+
+# Local outputs and personal data
+outputs/
+!outputs/sample_suggestions.csv
+data/private/
+
+# OS/editor junk
+.DS_Store
+*.swp
+
+# Env/keys
+.env

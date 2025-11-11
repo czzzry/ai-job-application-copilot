@@ -1,0 +1,3 @@
+We are hiring a Product/Program Manager to deliver AI-driven customer experience improvements.
+You will run LLM prompt/RAG experiments weekly, coordinate delivery, and partner with compliance on EU privacy and AI safety.
+Experience with contact center automation and voice AI is a plus. Demonstrated A/B testing and reliability focus needed.
