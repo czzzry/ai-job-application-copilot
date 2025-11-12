@@ -1,252 +1,256 @@
 #!/usr/bin/env python3
-"""
-job_copilot_starter.py — Tailor resume bullets to a Job Description (JD).
+# -*- coding: utf-8 -*-
 
-Usage:
-  python job_copilot_starter.py --resume examples/resume_bullets.txt --jd examples/jd.txt --provider local
-  python job_copilot_starter.py --resume my_resume.txt --jd jd.txt --provider openai --model gpt-4o-mini
 """
-import argparse, os, time, json, csv, re
+Job-Application Copilot (truth-constrained) — CLEAN STARTER (v2)
+
+- Inputs:
+    --resume : path to bullets file (one bullet per line)
+    --jd     : path to JD text (whole posting OK; extractor keeps 'asks')
+- Providers:
+    local    : heuristic rewrite (no API)
+    openai   : phrasing via OpenAI; still truth-guarded
+- Outputs (per run; inside --outdir):
+    suggestions.jsonl  : source_bullet, jd_req, suggested, similarity, support, latency_s
+    run_log.csv        : run summary
+- Notes:
+    * No torch deps; uses scikit-learn TF-IDF for mapping.
+"""
+
+import argparse, os, time, json, csv, re, sys
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Tuple
 
-from dotenv import load_dotenv
-from rich.console import Console
-from rich.table import Table
-from tqdm import tqdm
-
-import numpy as np
+# --- Similarity (TF-IDF) ---
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Optional: local embeddings (no API); falls back to TF-IDF if not installed.
-try:
-    from sentence_transformers import SentenceTransformer
-    _HAS_ST = True
-except Exception:
-    _HAS_ST = False
+def get_openai_client():
+    """Lazily import OpenAI and validate key only if provider=openai."""
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        raise RuntimeError("openai package not installed. Try: pip install openai") from e
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    return OpenAI()
 
-# Optional: OpenAI provider
-try:
-    from openai import OpenAI
-    _HAS_OPENAI = True
-except Exception:
-    _HAS_OPENAI = False
+# ----------------------------
+# Helpers
+# ----------------------------
 
-console = Console()
-load_dotenv()
+def read_resume_bullets(path: Path) -> List[str]:
+    text = path.read_text(encoding="utf-8")
+    bullets = [ln.strip(" •\t").strip() for ln in text.splitlines()]
+    return [b for b in bullets if b]
 
-def read_lines(path: str) -> List[str]:
-    text = Path(path).read_text(encoding="utf-8").strip()
-    # Split bullets either by newline or '•'
-    parts = [x.strip(" •\t") for x in re.split(r"\n+|•", text) if x.strip()]
-    return parts
+def extract_jd_reqs(jd_text: str) -> List[str]:
+    """
+    Extract JD 'asks':
+    - Keep bullet lines (-, *, •)
+    - Keep short requirement-like sentences
+    - Skip section headers (e.g., 'Responsibilities')
+    - Drop very long marketing sentences
+    """
+    lines = []
+    for raw in jd_text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
 
-def jd_requirements(jd_text: str) -> List[str]:
-    # Very simple extractor: split into sentences; keep those with strong verbs/nouns.
-    sents = re.split(r"(?<=[\.\?\!])\s+", jd_text.strip())
-    keep = []
-    for s in sents:
-        if any(k in s.lower() for k in ["experience", "own", "deliver", "ship", "ai", "privacy", "safety", "experiments", "voice", "contact center", "llm", "rag", "uptime", "reliability", "ab test", "a/b", "risk"]):
-            keep.append(s.strip())
-    # Also split on commas if sentence is long
-    reqs = []
-    for s in keep:
-        if len(s) > 160:
-            reqs.extend([x.strip() for x in s.split(",") if len(x.strip()) > 0])
+        # skip common headers
+        if s.lower() in {
+            "responsibilities", "requirements", "what you'll do", "what you will do",
+            "about the role", "about the job"
+        }:
+            continue
+
+        if s.startswith(("-", "*", "•")):
+            s = s.lstrip("-*•").strip()
+            if s:
+                lines.append(s)
         else:
-            reqs.append(s)
-    # Dedup and clean
-    uniq = []
-    seen = set()
-    for r in reqs:
-        k = r.lower()
-        if k not in seen:
-            uniq.append(r)
-            seen.add(k)
-    return uniq
+            # split paragraph-ish text; keep short 'asks' with useful verbs
+            parts = re.split(r"[.;]\s+", s)
+            for p in parts:
+                p = p.strip()
+                if 5 <= len(p) <= 240 and re.search(
+                    r"\b(own|drive|ship|deliver|build|lead|manage|scope|schedule|budget|risk|mitigat|"
+                    r"communicat|stakeholder|analy|metric|report|api|platform|reliab|uptime|ml|ai|privacy|gdpr)\w*\b",
+                    p, re.I
+                ):
+                    lines.append(p)
 
-def embed(texts: List[str], method: str = "auto") -> np.ndarray:
-    if method == "st" and _HAS_ST:
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        return model.encode(texts, normalize_embeddings=True)
-    # fallback: TF-IDF cosine
-    vec = TfidfVectorizer(max_features=4096, ngram_range=(1,2))
-    X = vec.fit_transform(texts)
-    return X.toarray() / (np.linalg.norm(X.toarray(), axis=1, keepdims=True) + 1e-9)
+    # drop overly long items
+    lines = [x for x in lines if len(x) <= 180]
 
-def map_bullets_to_reqs(bullets: List[str], reqs: List[str]) -> Dict[int, List[Tuple[int, float]]]:
-    embs = embed(bullets + reqs, method="st" if _HAS_ST else "tfidf")
-    B = embs[:len(bullets)]
-    R = embs[len(bullets):]
-    sims = cosine_similarity(B, R)
-    mapping = {}
-    for i in range(len(bullets)):
-        # top 3 matches
-        idxs = np.argsort(-sims[i])[:3]
-        mapping[i] = [(int(j), float(sims[i][j])) for j in idxs]
-    return mapping
+    # de-dup, preserve order
+    seen = set(); out = []
+    for x in lines:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out[:200]
 
-ACTION_VERBS = ["Led","Owned","Delivered","Shipped","Drove","Implemented","Launched","Coordinated","Optimized","Reduced","Increased","Improved"]
+def map_similarity(bullets: List[str], reqs: List[str]) -> List[Tuple[int,int,float]]:
+    """Return list of (req_idx, bullet_idx, score) for best bullet per req."""
+    if not bullets or not reqs:
+        return []
+    corpus = bullets + reqs
+    vec = TfidfVectorizer(min_df=1, ngram_range=(1,2)).fit(corpus)
+    B = vec.transform(bullets)
+    R = vec.transform(reqs)
+    sims = cosine_similarity(R, B)  # [len(reqs), len(bullets)]
+    best = []
+    for i in range(len(reqs)):
+        j = int(sims[i].argmax())
+        best.append((i, j, float(sims[i, j])))
+    return best
 
-def heuristic_rewrite(source: str, req: str) -> str:
-    # Keep metrics if present; mirror nouns/phrases from req; keep result to ~1 line.
-    # Extract %/numbers
-    m = re.findall(r"(\d+\.?\d*%|\d+\.?\d*)", source)
-    metric = m[0] if m else None
-    # Mirror a few nouns from req
-    nouns = re.findall(r"\b([A-Za-z]{4,})\b", req)
-    nouns = [n for n in nouns if n.lower() not in {"with","that","into","your","will","have","plus","needed","experience"}]
-    mirror = ", ".join(list(dict.fromkeys(nouns))[:3])
-    verb = ACTION_VERBS[hash(source) % len(ACTION_VERBS)]
-    # Build sentence
-    parts = [verb, source[0].lower() + source[1:]]
-    if mirror:
-        parts.append(f"— aligned to {mirror}")
-    if metric and "%" in metric and metric not in source:
-        parts.append(f" (result: {metric})")
-    out = " ".join(parts)
-    # Normalize
-    out = out.replace("  ", " ").strip()
-    # Trim to ~180 chars
-    return (out[:177] + "…") if len(out) > 180 else out
+def local_rewrite(source: str, req: str) -> str:
+    """Heuristic rewrite, truth-only. If weak evidence, caller will mark insufficient."""
+    return f"{source} — aligned to: {req}"
 
-def openai_rewrite(source: str, req: str, model: str) -> str:
-    if not _HAS_OPENAI:
-        raise RuntimeError("openai package not available. Use --provider local or pip install openai.")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY in environment.")
-    client = OpenAI(api_key=api_key)
-    sys = (
-        "You tailor resume bullets to a JD without inventing facts. "
-        "Never add employers, dates, titles, or metrics not present in SOURCE. "
-        "Be ATS-friendly, 1 line, strong verb, include metric if present."
-    )
-    prompt = f"JD REQUIREMENT:\n{req}\n\nSOURCE BULLET:\n{source}\n\nRewrite a single bullet. If insufficient evidence, say: 'INSUFFICIENT EVIDENCE — <reason>'."
+def openai_rewrite(client, model: str, source: str, req: str) -> Tuple[str, float]:
+    prompt = f"""
+Rewrite a single resume bullet so it directly addresses the JD requirement.
+
+Rules:
+- Use ONLY facts present in SOURCE. Do NOT add employers, titles, dates, new metrics, or tools not in source.
+- If SOURCE does not support the JD requirement, answer exactly: INSUFFICIENT EVIDENCE — <why>.
+
+JD REQUIREMENT:
+{req}
+
+SOURCE:
+{source}
+
+Write ONE polished bullet (single line). If insufficient, follow the rule above.
+"""
     t0 = time.time()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role":"system","content":sys},{"role":"user","content":prompt}],
-        temperature=0.2,
-        max_tokens=120,
-    )
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.3,
+            max_tokens=120,
+        )
+        text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        text = f"INSUFFICIENT EVIDENCE — API error: {e}"
     latency = time.time() - t0
-    text = resp.choices[0].message.content.strip()
     return text, latency
 
-def suggest(bullets: List[str], reqs: List[str], provider: str, model: str) -> List[Dict[str, Any]]:
-    mapping = map_bullets_to_reqs(bullets, reqs)
-    results = []
-    for bi, matches in mapping.items():
-        source = bullets[bi]
-        for (rj, score) in matches[:2]:
-            req = reqs[rj]
-            if provider == "openai":
-                try:
-                    text, latency = openai_rewrite(source, req, model=model)
-                except Exception as e:
-                    text = f"ERROR: {e}"
-                    latency = None
+def is_insufficient(s: str) -> bool:
+    return s.strip().upper().startswith(("INSUFFICIENT", "INS UFFICIENT"))
+
+# ----------------------------
+# Main run
+# ----------------------------
+
+def run_once(resume_path: Path, jd_path: Path, provider: str, model: str, outdir: Path):
+    outdir.mkdir(parents=True, exist_ok=True)
+    sug_path = outdir / "suggestions.jsonl"
+    log_path = outdir / "run_log.csv"
+
+    bullets = read_resume_bullets(resume_path)
+    jd_text = jd_path.read_text(encoding="utf-8")
+    reqs = extract_jd_reqs(jd_text)
+
+    best = map_similarity(bullets, reqs)
+
+    client = None
+    if provider == "openai":
+        client = get_openai_client()
+        if not model:
+            raise RuntimeError("With --provider openai, pass --model (e.g., gpt-4o-mini).")
+
+    # Threshold — conservative support, but not too strict for PM
+    SIM_THRESH = 0.08  # was 0.18
+
+    suggestions = []
+    latencies = []
+
+    with sug_path.open("w", encoding="utf-8") as f:
+        for (req_idx, bul_idx, score) in best:
+            req = reqs[req_idx]
+            source = bullets[bul_idx]
+            if score < SIM_THRESH:
+                suggested = f"INSUFFICIENT EVIDENCE — source bullet does not support: {req}"
+                latency = 0.0
             else:
-                t0 = time.time()
-                text = heuristic_rewrite(source, req)
-                latency = time.time() - t0
-            # Truthfulness gate: if the model says insufficient, mark low support
-            support = "supported"
-            if text.upper().startswith("INSUFFICIENT EVIDENCE"):
-                support = "insufficient"
-            results.append({
-                "jd_req": req,
+                if provider == "openai":
+                    suggested, latency = openai_rewrite(client, model, source, req)
+                else:
+                    suggested = local_rewrite(source, req)
+                    latency = 0.0
+
+            latencies.append(latency)
+            rec = {
                 "source_bullet": source,
-                "suggested": text,
-                "similarity": round(score, 3),
-                "support": support,
-                "latency_s": None if latency is None else round(latency, 3),
-            })
-    return results
+                "jd_req": req,
+                "suggested": suggested,
+                "similarity": round(score, 4),
+                "support": (score >= SIM_THRESH) and (not is_insufficient(suggested)),
+                "latency_s": round(latency, 3),
+            }
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            suggestions.append(rec)
 
-def write_jsonl(path: str, rows: List[Dict[str, Any]]):
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "ts","provider","model","resume","jd",
+            "reqs","bullets","suggestions","mean_latency_s","insufficient_count"
+        ])
+        w.writerow([
+            ts, provider, model or "", str(resume_path), str(jd_path),
+            len(reqs), len(bullets), len(suggestions),
+            round(sum(latencies)/len(latencies), 3) if latencies else 0.0,
+            sum(1 for r in suggestions if is_insufficient(r["suggested"]))
+        ])
 
-def write_log(path: str, rows: List[Dict[str, Any]]):
-    cols = sorted({k for r in rows for k in r.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["timestamp"]+cols)
-        w.writeheader()
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        for r in rows:
-            rr = {"timestamp": ts, **r}
-            w.writerow(rr)
+    print(f"Wrote {sug_path}")
+    print(f"Wrote {log_path}")
+    return sug_path, log_path
 
-def run_eval(eval_csv: str, provider: str, model: str):
-    import pandas as pd
-    df = pd.read_csv(eval_csv)
-    rows = []
-    for _, row in df.iterrows():
-        out = suggest([row["resume_bullet"]], [row["job_requirement"]], provider, model)
-        sug = out[0]["suggested"]
-        grounded = ("INSUFFICIENT" not in sug.upper()) and all(
-            tok.lower() in (row["resume_bullet"].lower()+" "+row["job_requirement"].lower())
-            or tok.isdigit() or tok.lower() in {"the","a","an","to","and","of","for","with","by","on"}
-            for tok in re.findall(r"[A-Za-z0-9%]+", sug)
-        )
-        rows.append({
-            "id": row["id"],
-            "suggested": sug,
-            "grounded_guess": int(grounded),
-            "notes": ""
-        })
-    out_path = "outputs/eval_results.csv"
-    Path("outputs").mkdir(exist_ok=True, parents=True)
-    pd.DataFrame(rows).to_csv(out_path, index=False)
-    console.print(f"[bold green]Eval results written to {out_path}[/bold green]")
-    # Pretty print
-    table = Table(title="Eval — groundedness (heuristic)")
-    table.add_column("ID"); table.add_column("Grounded?"); table.add_column("Suggestion", overflow="fold", max_width=80)
-    for r in rows:
-        table.add_row(r["id"], "✅" if r["grounded_guess"] else "⚠️", r["suggested"][:400])
-    console.print(table)
+# ----------------------------
+# CLI
+# ----------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", type=str, help="Path to resume bullets (.txt, one per line)")
-    parser.add_argument("--jd", type=str, help="Path to job description (.txt)")
-    parser.add_argument("--provider", type=str, choices=["local","openai"], default="local")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--eval", type=str, help="Path to golden_questions.csv to run evaluation")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--resume", required=False, help="Path to resume bullets (one per line).")
+    p.add_argument("--jd", required=False, help="Path to JD text.")
+    p.add_argument("--provider", choices=["local","openai"], default="local")
+    p.add_argument("--model", help="OpenAI model (when provider=openai), e.g. gpt-4o-mini.")
+    p.add_argument("--eval", help="Path to golden_questions.csv (optional; heuristic eval).")
+    p.add_argument("--outdir", default="outputs", help="Directory to write artifacts (default: outputs)")
+    args = p.parse_args()
 
-    Path("outputs").mkdir(exist_ok=True, parents=True)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     if args.eval:
-        run_eval(args.eval, args.provider, args.model)
-        return
+        print("Eval mode not included in this trimmed starter. (Keep using your previous eval script if needed.)")
+        sys.exit(0)
 
     if not args.resume or not args.jd:
-        console.print("[red]Provide --resume and --jd or use --eval[/red]")
-        return
+        print("ERROR: --resume and --jd are required (unless using --eval).", file=sys.stderr)
+        sys.exit(2)
 
-    bullets = read_lines(args.resume)
-    jd_text = Path(args.jd).read_text(encoding="utf-8")
-    reqs = jd_requirements(jd_text)
+    resume_path = Path(args.resume)
+    jd_path = Path(args.jd)
+    if not resume_path.exists():
+        print(f"ERROR: resume file not found: {resume_path}", file=sys.stderr); sys.exit(2)
+    if not jd_path.exists():
+        print(f"ERROR: JD file not found: {jd_path}", file=sys.stderr); sys.exit(2)
 
-    console.print(f"[bold]Loaded[/bold] {len(bullets)} bullets and {len(reqs)} JD requirements.")
-    results = suggest(bullets, reqs, args.provider, args.model)
+    print(f"Using resume: {resume_path}")
+    print(f"Using JD: {jd_path}")
+    print(f"Writing artifacts to: {outdir}")
 
-    write_jsonl("outputs/suggestions.jsonl", results)
-    write_log("outputs/run_log.csv", results)
-
-    # Show a small table
-    table = Table(title="Top suggestions")
-    table.add_column("Sim"); table.add_column("Support"); table.add_column("Source", overflow="fold", max_width=50)
-    table.add_column("JD Req", overflow="fold", max_width=50); table.add_column("Suggested", overflow="fold", max_width=70)
-    for r in results[:10]:
-        table.add_row(str(r["similarity"]), r["support"], r["source_bullet"], r["jd_req"], r["suggested"])
-    console.print(table)
-    console.print("[green]Wrote outputs to outputs/suggestions.jsonl and outputs/run_log.csv[/green]")
+    run_once(resume_path, jd_path, args.provider, args.model or "", outdir)
 
 if __name__ == "__main__":
     main()

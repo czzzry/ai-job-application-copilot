@@ -1,13 +1,36 @@
+# Job-Application Copilot (truth-constrained)
 
+A small, production-minded tool that tailors resume bullets to a job description **without fabricating facts**. It maps your bullets to JD requirements, rewrites for clarity, and shows provenance (which source bullet supports which suggestion).
 
-## Make outputs easy to read (helper)
-From the project folder:
+- **Two modes:** local heuristic (no API) or LLM rewriter (OpenAI).
+- **Groundedness:** suggestions must tie back to your source bullets; insufficient evidence → the tool says so.
+- **Artifacts:** writes JSONL/CSV logs so you can curate and audit.
+- **Safety:** minimal data handling; no server-side persistence by default.
+
+## Quickstart
+
+### Local (no API key)
 ```bash
-python make_readable.py --open
-```
-This writes:
-- `outputs/suggestions.csv` (spreadsheet-friendly)
-- `outputs/suggestions_pretty.json` (valid JSON array)
-- `outputs/run_log_pretty.txt` (aligned columns)
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
-Use `--no-pretty` to skip the pretty JSON/TXT and only produce the CSV.
+python job_copilot_starter.py \
+  --provider local \
+  --resume examples/resume_bullets.txt \
+  --jd examples/jd.txt \
+  --outdir "outputs/runs/example_$(date +%Y-%m-%d_%H-%M)"
+
+python make_readable.py --open
+
+export OPENAI_API_KEY="sk-..."       # or add it to ~/.zshrc
+python job_copilot_starter.py \
+  --provider openai --model gpt-4o-mini \
+  --resume data/private/my_resume_bullets.txt \
+  --jd data/private/my_jd.txt \
+  --outdir "outputs/runs/company-role_$(date +%Y-%m-%d_%H-%M)"
+
+python make_readable.py --open
+
+q
+q

@@ -14,3 +14,15 @@ data/private/
 
 # Env/keys
 .env
+# app outputs
+outputs/
+!outputs/sample_suggestions.csv
+
+# private inputs
+data/private/
+
+# local venv
+.venv/
+
+# macOS junk
+.DS_Store
